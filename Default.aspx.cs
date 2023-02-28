@@ -9,6 +9,7 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using System.Net.Http;
+using System.Net.Http.Json;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -17,257 +18,383 @@ using System.Net.Http.Headers;
 using System.Text.Json.Serialization;
 using System.Web;
 using Org.BouncyCastle.Math;
+using System.Runtime.CompilerServices;
+using Org.BouncyCastle.Crypto.Generators;
+using Org.BouncyCastle.Security;
+using System.Net;
 
 namespace Satispay
 {
-
-    public class SatispayRequestSigningDelegatingHandler : DelegatingHandler
+    public enum Flow
     {
-        private readonly string _keyId;
-        private readonly string _privateKey;
+        MATCH_CODE,
+        MATCH_USER,
+        REFUND,
+        PRE_AUTHORIZED
+    }
+    public enum PaymentType
+    {
+        TO_BUSINESS,
+        REFUND_TO_BUSINESS
+    }
+    public enum Status
+    {
+        PENDING,
+        ACCEPTED,
+        CANCELED
+    }
+    public enum ActorType
+    {
+        CONSUMER,
+        SHOP
+    }
 
-        public SatispayRequestSigningDelegatingHandler(
-            string keyId,
-            string privateKey,
-            HttpMessageHandler innerHandler) : base(innerHandler)
+    public enum UpdateAction
+    {
+        ACCEPT,
+        CANCEL,
+        CANCEL_OR_REFUND
+    }
+
+    public class CreatePaymentRequest<T>
+    {
+        [JsonConverter(typeof(JsonStringEnumConverter))]
+        public Flow flow { get; set; }
+        public int amount_unit { get; set; }
+
+        //For PRE_AUTHORIZED Flow
+        public string pre_authorized_payments_token { get; set; }
+
+        //For REFUND Flow
+        public string parent_payment_uid { get; set; }
+        public string currency { get; set; } = "EUR";
+
+        [JsonConverter(typeof(SatispayDateTimeConverter))]
+        public DateTime? expiration_date { get; set; }
+
+        //Order ID or payment external identifier
+        public string external_code { get; set; }
+
+        //https://myServer.com/myCallbackUrl?payment_id={uuid}
+        public string callback_url { get; set; }
+
+        //For MATCH_CODE Flow
+        //https://myServer.com/myRedirectUrl
+        public string redirect_url { get; set; }
+        public T metadata { get; set; }
+
+        //For MATCH_USER Flow
+        public string consumer_uid { get; set; }
+    }
+
+
+    public class Sender
+    {
+        public string id { get; set; }
+
+        [JsonConverter(typeof(JsonStringEnumConverter))]
+        public ActorType type { get; set; } = ActorType.CONSUMER;
+        public string name { get; set; }
+    }
+
+    public class Receiver
+    {
+        public string id { get; set; }
+
+        [JsonConverter(typeof(JsonStringEnumConverter))]
+        public ActorType type { get; set; } = ActorType.SHOP;
+    }
+
+    public class PaymentResponse<T>
+    {
+        public string id { get; set; }
+
+        //QR Code
+        public string code_identifier { get; set; }
+
+        [JsonConverter(typeof(JsonStringEnumConverter))]
+        public PaymentType type { get; set; }
+        public int amount_unit { get; set; }
+        public string currency { get; set; } = "EUR";
+
+        [JsonConverter(typeof(JsonStringEnumConverter))]
+        public Status status { get; set; }
+        public bool expired { get; set; }
+
+        //Metadata inserted within the payment request
+        public T metadata { get; set; }
+        public Sender sender { get; set; }
+        public Receiver receiver { get; set; }
+
+        [JsonConverter(typeof(SatispayDateTimeConverter))]
+        public DateTime? insert_date { get; set; }
+
+        [JsonConverter(typeof(SatispayDateTimeConverter))]
+        public DateTime? expire_date { get; set; }
+
+        //Order ID or payment external identifier
+        public string external_code { get; set; }
+
+        //https://online.satispay.com/pay/41da7b74-a9f4-4d25-8428-0e3e460d90c1?redirect_url=https%3A%2F%2FmyServer.com%2FmyRedirectUrl
+        public string redirect_url { get; set; }
+    }
+
+    public class CreatePaymentResponse<T> : PaymentResponse<T>
+    {
+        public string QrCodeUrl { get; set; }
+    }
+
+    public class SatispayDateTimeConverter : JsonConverter<DateTime?>
+    {
+        private static readonly string _format = "yyyy-MM-ddTHH:mm:ss.fffZ";
+        public override DateTime? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
         {
-            _keyId = keyId;
-            _privateKey = privateKey;
+            return DateTime.ParseExact(reader.GetString(), _format, System.Globalization.CultureInfo.InvariantCulture);
         }
 
-        public SatispayRequestSigningDelegatingHandler(
-            string keyId,
-            string privateKey,
-            bool createInnerHandler = false)
+        public override void Write(Utf8JsonWriter writer, DateTime? value, JsonSerializerOptions options)
         {
-            _keyId = keyId;
-            _privateKey = privateKey;
+            if (value.HasValue)
+                writer.WriteStringValue(value.Value.ToUniversalTime().ToString(_format));
+            else
+                writer.WriteNullValue();
+        }
+    }
 
-            if (createInnerHandler)
-                InnerHandler = new HttpClientHandler();
+    public class Api
+    {
+        private const string baseDomain = "authservices.satispay.com";
+        public string PrivateKey { get; set; }
+        public string PublicKey { get; set; }
+        public string KeyId { get; set; }
+        public string Version { get; private set; } = "1.2.0";
+        public bool IsSandbox { get; private set; }
+
+        private HttpClient httpClient;
+
+        private AsymmetricCipherKeyPair ackp;
+
+        public Api(HttpClient httpClient, bool isSandBox = false)
+        {
+            IsSandbox = isSandBox;
+            this.httpClient = httpClient;
+            httpClient.BaseAddress = isSandBox ?
+            new Uri($"https://staging.{baseDomain}/g_business/v1/") :
+            new Uri($"https://{baseDomain}/g_business/v1/");
         }
 
-        protected override async Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request,
-            CancellationToken cancellationToken)
+        public string GenerateRsaKeys()
         {
-            await AddDigestHeaderAsync(request);
+            RsaKeyPairGenerator rkpg = new RsaKeyPairGenerator();
+            rkpg.Init(new KeyGenerationParameters(new SecureRandom(), 4096));
+            ackp = rkpg.GenerateKeyPair();
 
-            AddAuthorizationHeader(request);
+            PublicKey = GetPem(ackp.Public);
 
-            return await base.SendAsync(request, cancellationToken);
+            PrivateKey = GetPem(ackp.Private);
+
+            return PrivateKey;
         }
 
-        private static async Task AddDigestHeaderAsync(HttpRequestMessage request)
+        private string GetPem(AsymmetricKeyParameter akp)
         {
-            var body = request.Content != null
-                ? await request.Content.ReadAsStringAsync()
-                : string.Empty;
+            StringBuilder keyPem = new StringBuilder();
+            PemWriter pemWriter = new PemWriter(new StringWriter(keyPem));
+            pemWriter.WriteObject(akp);
+            pemWriter.Writer.Flush();
 
-            using (var sha256 = SHA256.Create())
+            return keyPem.ToString().Replace("\r", string.Empty);
+        }
+
+        public void SetAsymmetricKeyParameter(string pemPrivateKey)
+        {
+            var pemReader = new PemReader(new StringReader(pemPrivateKey));
+            ackp = (AsymmetricCipherKeyPair)pemReader.ReadObject();
+        }
+
+
+        public class RequestKeyIdRequest
+        {
+            public string public_key { get; set; }
+
+            public string token { get; set; }
+        }
+
+        public class RequestKeyIdResponse
+        {
+            public string key_id { get; set; }
+        }
+
+        public async Task<string> RequestKeyId(RequestKeyIdRequest request)
+        {
+            if (string.IsNullOrWhiteSpace(request.token))
+                throw new ArgumentNullException("Missing activationToken argument");
+
+            request.public_key = request.public_key ?? PublicKey;
+
+            if (string.IsNullOrWhiteSpace(request.public_key))
+                throw new ArgumentNullException("Missing PublicKey");
+
+            HttpResponseMessage response = null;
+
+            try
             {
-                var hashed = sha256.ComputeHash(Encoding.UTF8.GetBytes(body));
-                request.Headers.Add("Digest", $"SHA-256={Convert.ToBase64String(hashed)}");
+                response = await httpClient.PostAsJsonAsync("authentication_keys", request);
+
+                response.EnsureSuccessStatusCode();
+
+                var result = await response.Content.ReadFromJsonAsync<RequestKeyIdResponse>();
+
+                KeyId = result.key_id;
+
+                return KeyId;
+            }
+            catch (HttpRequestException ex)
+            {
+                switch (response.StatusCode)
+                {
+                    case HttpStatusCode.NotFound:
+                        throw new ActivationTokenNotFoundException();
+                    case HttpStatusCode.Forbidden:
+                        throw new ActivationTokenAlreadyPairedException();
+                    case HttpStatusCode.BadRequest:
+                        throw new InvalidRsaKeyException();
+                }
+
+                throw ex;
             }
         }
 
-        private void AddAuthorizationHeader(HttpRequestMessage request)
+        private async Task<T> SendJsonAsync<T>(HttpMethod method, string requestUri, object content = null, string idempotencyKey = null)
         {
-            var @string = BuildStringToSign(request);
-            var signature = SignData(@string);
+            var requestJson = string.Empty;
 
-            var header = $"keyId=\"{_keyId}\", algorithm=\"rsa-sha256\", headers=\"(request-target) host date digest\", signature=\"{Convert.ToBase64String(signature)}\"";
-            request.Headers.Authorization = new AuthenticationHeaderValue("Signature", header);
-        }
+            if (content != null)
+                requestJson = JsonSerializer.Serialize(content, new JsonSerializerOptions()
+                {
+                    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+                    WriteIndented = true
+                });
 
-        private byte[] SignData(string data)
-        {
-            using (var rsa = RSA.Create())
+            var httpRequestMessage = new HttpRequestMessage(method, requestUri)
             {
-                rsa.ImportParameters(ImportPrivateKey(_privateKey));
-                return rsa.SignData(Encoding.UTF8.GetBytes(data), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                Content = content == null ? null : new StringContent(requestJson, Encoding.UTF8, "application/json")
+            };
+
+            using (SHA256 sha256 = SHA256.Create())
+            {
+                var now = DateTime.Now;
+                var date = now.ToString("ddd, d MMM yyyy HH:mm:ss", CultureInfo.InvariantCulture) + " " + now.ToString("zzz").Replace(":", string.Empty);
+
+                httpRequestMessage.Headers.Add("Date", date);
+
+                var signature = new StringBuilder();
+
+                signature.Append($"(request-target): {method.Method.ToLower()} {httpClient.BaseAddress.LocalPath}{requestUri}\n");
+                signature.Append($"host: {httpClient.BaseAddress.Host}\n");
+                signature.Append($"date: {((string[])httpRequestMessage.Headers.GetValues("Date"))[0]}\n");
+
+                var digest = $"SHA-256={Convert.ToBase64String(sha256.ComputeHash(Encoding.UTF8.GetBytes(requestJson)))}";
+
+                signature.Append($"digest: {digest}");
+
+                var sign = SignData(signature.ToString(), ackp.Private);
+
+                httpRequestMessage.Headers.Add("Digest", digest);
+                httpRequestMessage.Headers.Add("Authorization",
+                    $"Signature keyId=\"{KeyId}\", algorithm=\"rsa-sha256\", headers=\"(request-target) host date digest\", signature=\"{sign}\"");
+
+                if (idempotencyKey != null)
+                    httpRequestMessage.Headers.Add("Idempotency-Key", idempotencyKey);
+
+                httpRequestMessage.Headers.Add("x-satispay-appn", "Satispay.NET");
+
+                HttpResponseMessage response = null;
+
+                string stringContent = string.Empty;
+
+                try
+                {
+                    response = await httpClient.SendAsync(httpRequestMessage);
+
+                    stringContent = await response.Content.ReadAsStringAsync();
+
+                    response.EnsureSuccessStatusCode();
+
+                    return JsonSerializer.Deserialize<T>(stringContent);
+                }
+                catch (HttpRequestException)
+                {
+                    throw new SatispayException(stringContent, response.StatusCode);
+                }
+                catch (JsonException)
+                {
+                    throw new SatispayException(stringContent, HttpStatusCode.OK);
+                }
             }
         }
 
-        public static RSAParameters ImportPrivateKey(string pem)
+        private string SignData(string msg, AsymmetricKeyParameter privKey)
         {
-            PemReader pr = new PemReader(new StringReader(pem));
-            RsaPrivateCrtKeyParameters privKey = (RsaPrivateCrtKeyParameters)pr.ReadObject();
-            RSAParameters rp = new RSAParameters();
-            rp.Modulus = privKey.Modulus.ToByteArrayUnsigned();
-            rp.Exponent = privKey.PublicExponent.ToByteArrayUnsigned();
-            rp.P = privKey.P.ToByteArrayUnsigned();
-            rp.Q = privKey.Q.ToByteArrayUnsigned();
-            rp.D = ConvertRSAParametersField(privKey.Exponent, rp.Modulus.Length);
-            rp.DP = ConvertRSAParametersField(privKey.DP, rp.P.Length);
-            rp.DQ = ConvertRSAParametersField(privKey.DQ, rp.Q.Length);
-            rp.InverseQ = ConvertRSAParametersField(privKey.QInv, rp.Q.Length);
+            byte[] msgBytes = Encoding.UTF8.GetBytes(msg);
 
+            ISigner signer = SignerUtilities.GetSigner("SHA256WithRSA");
+            signer.Init(true, privKey);
+            signer.BlockUpdate(msgBytes, 0, msgBytes.Length);
+            byte[] sigBytes = signer.GenerateSignature();
 
-            return rp;
+            return Convert.ToBase64String(sigBytes);
         }
 
-        private static byte[] ConvertRSAParametersField(BigInteger n, int size)
+        private bool VerifySignature(AsymmetricKeyParameter pubKey, string signature, string msg)
         {
-            byte[] bs = n.ToByteArrayUnsigned();
-            if (bs.Length == size)
-                return bs;
-            if (bs.Length > size)
-                throw new ArgumentException("Specified size too small", "size");
-            byte[] padded = new byte[size];
-            Array.Copy(bs, 0, padded, size - bs.Length, bs.Length);
-            return padded;
+            byte[] msgBytes = Encoding.UTF8.GetBytes(msg);
+            byte[] sigBytes = Convert.FromBase64String(signature);
+
+            ISigner signer = SignerUtilities.GetSigner("SHA256WithRSA");
+            signer.Init(false, pubKey);
+            signer.BlockUpdate(msgBytes, 0, msgBytes.Length);
+            return signer.VerifySignature(sigBytes);
         }
 
-        private static string BuildStringToSign(HttpRequestMessage request)
-            => new StringBuilder()
-                .AppendLine($"(request-target): {request.Method.ToString().ToLowerInvariant()} {request.RequestUri.PathAndQuery}")
-                .AppendLine($"host: {request.RequestUri.Host}")
-                .AppendLine($"date: {request.Headers.Date?.UtcDateTime:ddd, dd MMM yyyy HH:mm:ss z}")
-                .Append($"digest: {request.Headers.GetValues("Digest").Single()}")
-                .ToString();
+        public async Task<CreatePaymentResponse<T>> CreatePayment<T>(CreatePaymentRequest<T> request, string idempotencyKey = null)
+        {
+            if (request.amount_unit == 0)
+                throw new SatispayException("amount_unit must be greater than 0", HttpStatusCode.BadRequest);
+
+            var response = await SendJsonAsync<CreatePaymentResponse<T>>(HttpMethod.Post, "payments", request, idempotencyKey);
+
+            //TODO
+            response.QrCodeUrl = IsSandbox ? $"https://staging.online.satispay.com/qrcode/{response.code_identifier}" : $"https://online.satispay.com/qrcode/{response.code_identifier}";
+
+            return response;
+        }
+        public async Task<PaymentDetailsResponse<T>> GetPaymentDetails<T>(string paymentId)
+        {
+            return await SendJsonAsync<PaymentDetailsResponse<T>>(HttpMethod.Get, $"payments/{paymentId}");
+        }
+        public async Task<PaymentDetailsResponse<T>> UpdatePaymentDetails<T>(string paymentId, UpdatePaymentRequest<T> request)
+        {
+            return await SendJsonAsync<PaymentDetailsResponse<T>>(HttpMethod.Put, $"payments/{paymentId}", request);
+        }
     }
 
 
 
 
-    public partial class Default : System.Web.UI.Page
-    {
-        private const string ApiUrl = "https://staging.authservices.satispay.com/g_business/";
-        private const string SandboxApiUrl = "https://staging.authservices.satispay.com/g_business/";
-        private HttpClient BuildClient(
-            string keyId,
-            string privateKey,
-            bool production)
+
+
+
+
+
+    private async Task callSatispayAuthentication(string keyId, string privateKey)
         {
-            var requestSigningHandler = new SatispayRequestSigningDelegatingHandler(keyId, privateKey, true);
-
-            return new HttpClient(requestSigningHandler)
-            {
-                BaseAddress = new Uri(production ? ApiUrl : SandboxApiUrl)
-            };
-        }
-
-        internal class TestSignatureRequest
-        {
-            [JsonPropertyName("flow")]
-            public string Flow { get; set; }
-            [JsonPropertyName("amount_unit")]
-            public int AmountUnit { get; set; }
-            [JsonPropertyName("currency")]
-            public string Currency { get; set; }
-        }
-
-        internal class AuthenticationResource
-        {
-            [JsonPropertyName("authentication_key")]
-            public AuthenticationKeyResource AuthenticationKey { get; set; }
-            [JsonPropertyName("signature")]
-            public SignatureResource Signature { get; set; }
-            [JsonPropertyName("signed_string")]
-            public string SignedString { get; set; }
-
-            public class AuthenticationKeyResource
-            {
-                [JsonPropertyName("access_key")]
-                public string AccessKey { get; set; }
-                [JsonPropertyName("customer_uid")]
-                public string CustomerUid { get; set; }
-                [JsonPropertyName("key_type")]
-                public string KeyType { get; set; }
-                [JsonPropertyName("auth_type")]
-                public string AuthType { get; set; }
-                [JsonPropertyName("role")]
-                public string Role { get; set; }
-                [JsonPropertyName("enable")]
-                public bool Enable { get; set; }
-                [JsonPropertyName("insert_date")]
-                public DateTime InsertDate { get; set; }
-                [JsonPropertyName("version")]
-                public int Version { get; set; }
-            }
-
-            public class SignatureResource
-            {
-                [JsonPropertyName("key_id")]
-                public string KeyId { get; set; }
-                [JsonPropertyName("algorithm")]
-                public string Algorithm { get; set; }
-                [JsonPropertyName("headers")]
-                public string[] Headers { get; set; }
-                [JsonPropertyName("signature")]
-                public string Signature { get; set; }
-                [JsonPropertyName("resign_required")]
-                public bool ResignRequired { get; set; }
-                [JsonPropertyName("iteration_count")]
-                public int IterationCount { get; set; }
-                [JsonPropertyName("valid")]
-                public bool Valid { get; set; }
-            }
-        }
-
-        public class SatispayError
-        {
-            [JsonPropertyName("code")]
-            public int Code { get; set; }
-            [JsonPropertyName("message")]
-            public string Message { get; set; }
-        }
-
-        private static async Task ThrowErrorIfAnyAsync(HttpResponseMessage response)
-        {
-            if (response.IsSuccessStatusCode)
-                return;
-
-            var body = await response.Content.ReadAsStringAsync();
-            var error = JsonSerializer.Deserialize<SatispayError>(body);
-
-           if (error != null)
-                throw new Exception(" errore: "+response.StatusCode+" "+ error.Code+ " " + error.Message);
-        }
-
-        private static async Task<T> SendRequestAsync<T>(
-            HttpClient httpClient,
-            HttpMethod httpMethod,
-            string requestUri,
-            object requestBody,
-            CancellationToken cancellationToken)
-        {
-            var request = new HttpRequestMessage(httpMethod, requestUri);
-            if (requestBody != null)
-                request.Content = new StringContent(JsonSerializer.Serialize(requestBody, new JsonSerializerOptions
-                {
-                    WriteIndented = true
-                }), Encoding.UTF8, "application/json");
-            var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-            await ThrowErrorIfAnyAsync(response);
-
-            var responseBody = await response.Content.ReadAsStringAsync();
-
-            return responseBody?.Length > 0
-                ? JsonSerializer.Deserialize<T>(responseBody)
-                : default;
-        }
-        private Task<AuthenticationResource> TestAuthenticationAsync(
-            string keyId,
-            string privateKey,
-            CancellationToken cancellationToken = default)
-        {
-            var httpClient = BuildClient(keyId, privateKey, false);
-
-            return SendRequestAsync<AuthenticationResource>(
-                httpClient, HttpMethod.Post, "/wally-services/protocol/tests/signature", new TestSignatureRequest
-                {
-                    Flow = "MATCH_CODE",
-                    AmountUnit = 100,
-                    Currency = "EUR"
-                }, cancellationToken);
+            var AuthenticationResource = await TestAuthenticationAsync(keyId, privateKey);
         }
 
 
 
-
-        protected async Task Page_LoadAsync(object sender, EventArgs e)
+        protected  void Page_Load(object sender, EventArgs e)
         {
             string key_id = "mke3o60ri96gcb7dlmm17jct37kn4j7781i9h53b49584qucbnl4msg8f4rfqnki57om3v86l4ugj6qpr8cfok5bi8lt1tm6mnirqcct15tnggv9gcp2d7kk0g93u5m7h565gcpuati100ourih6prp9es2ns4s0kg67hkpkqql9pisa9103e09k9q1itgj6ulbpp345";
             //string staging_key_id = "tn95lce37u3e4q5hhbrdb50lh70iql22atd3nonr5qclhrpas044vhv23vl9rfngsi9tllvil29ns7vpc2jdn0oa4mvtg0223gba47flke0u1ace2q1v9mivbsm3be3pmd41rqaknv6t652e35k54p340kn6ek7d1l7r4dau4f0gmsd1d19gda5f36ioehkpgh5hbau9";
@@ -288,8 +415,7 @@ namespace Satispay
             DateTime data = DateTime.Now;
             var date = data.ToString("ddd, d MMM yyyy HH:mm:ss", CultureInfo.InvariantCulture) + " " + data.ToString("zzz").Replace(":", string.Empty);
 
-
-            AuthenticationResource authenticationResource = await TestAuthenticationAsync(key_id, privateKey.ToString());
+            RegisterAsyncTask(new System.Web.UI.PageAsyncTask(()=>callSatispayAuthentication(key_id,privateKeyPem)));
             //string digest;
             //using (SHA256 sha256 = SHA256.Create())
             //{
