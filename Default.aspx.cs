@@ -253,12 +253,12 @@ namespace Satispay
             {
                 switch (response.StatusCode)
                 {
-                    case HttpStatusCode.NotFound:
-                        throw new ActivationTokenNotFoundException();
-                    case HttpStatusCode.Forbidden:
-                        throw new ActivationTokenAlreadyPairedException();
-                    case HttpStatusCode.BadRequest:
-                        throw new InvalidRsaKeyException();
+                    //case HttpStatusCode.NotFound:
+                    //    throw new ActivationTokenNotFoundException();
+                    //case HttpStatusCode.Forbidden:
+                    //    throw new ActivationTokenAlreadyPairedException();
+                    //case HttpStatusCode.BadRequest:
+                    //    throw new InvalidRsaKeyException();
                 }
 
                 throw ex;
