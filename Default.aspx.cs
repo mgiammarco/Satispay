@@ -402,19 +402,28 @@ namespace Satispay
     {
 
 
-        private async Task callSatispayAuthentication(string keyId, string privateKey)
+        private async Task callSatispayAuthentication(string privateKey)
         {
+            HttpClient client = new HttpClient();
 
-        Api api = new Api(null, true);
-        api.PrivateKey=privateKey;
-        var pResponse = await api.CreatePayment(null,null);
+            Api api = new Api(client, true);
+            api.PrivateKey=privateKey;
+            api.SetAsymmetricKeyParameter(privateKey);
+            var pRequest = new Satispay.CreatePaymentRequest<string>();
+
+            //string body = "{\"flow\":\"MATCH_CODE\",\"amount_unit\":100,\"currency\":\"EUR\"}";
+
+            pRequest.amount_unit = 100;
+            pRequest.currency = "EUR";
+            pRequest.flow = Flow.MATCH_CODE;
+            var pResponse = await api.CreatePayment(pRequest,null);
         }
 
 
 
         protected  void Page_Load(object sender, EventArgs e)
         {
-            string key_id = "mke3o60ri96gcb7dlmm17jct37kn4j7781i9h53b49584qucbnl4msg8f4rfqnki57om3v86l4ugj6qpr8cfok5bi8lt1tm6mnirqcct15tnggv9gcp2d7kk0g93u5m7h565gcpuati100ourih6prp9es2ns4s0kg67hkpkqql9pisa9103e09k9q1itgj6ulbpp345";
+            //string key_id = "mke3o60ri96gcb7dlmm17jct37kn4j7781i9h53b49584qucbnl4msg8f4rfqnki57om3v86l4ugj6qpr8cfok5bi8lt1tm6mnirqcct15tnggv9gcp2d7kk0g93u5m7h565gcpuati100ourih6prp9es2ns4s0kg67hkpkqql9pisa9103e09k9q1itgj6ulbpp345";
             //string staging_key_id = "tn95lce37u3e4q5hhbrdb50lh70iql22atd3nonr5qclhrpas044vhv23vl9rfngsi9tllvil29ns7vpc2jdn0oa4mvtg0223gba47flke0u1ace2q1v9mivbsm3be3pmd41rqaknv6t652e35k54p340kn6ek7d1l7r4dau4f0gmsd1d19gda5f36ioehkpgh5hbau9";
 
 
@@ -422,18 +431,18 @@ namespace Satispay
             string privateKeyFilePath = Server.MapPath("/pem/private.pem");
             string privateKeyPem = File.ReadAllText(privateKeyFilePath);
 
-            var pemReader = new PemReader(new StringReader(privateKeyPem));
-            var keyPair = (AsymmetricCipherKeyPair)pemReader.ReadObject();
-            var privateKey = (RsaPrivateCrtKeyParameters)keyPair.Private;
+            //var pemReader = new PemReader(new StringReader(privateKeyPem));
+            //var keyPair = (AsymmetricCipherKeyPair)pemReader.ReadObject();
+            //var privateKey = (RsaPrivateCrtKeyParameters)keyPair.Private;
 
 
             //string body = "{\"flow\":\"MATCH_CODE\",\"amount_unit\":100,\"currency\":\"EUR\"}";
             //string body = "{\n  \"flow\": \"MATCH_CODE\",\n  \"amount_unit\": 100,\n  \"currency\": \"EUR\"\n}";
 
-            DateTime data = DateTime.Now;
-            var date = data.ToString("ddd, d MMM yyyy HH:mm:ss", CultureInfo.InvariantCulture) + " " + data.ToString("zzz").Replace(":", string.Empty);
+            //DateTime data = DateTime.Now;
+            //var date = data.ToString("ddd, d MMM yyyy HH:mm:ss", CultureInfo.InvariantCulture) + " " + data.ToString("zzz").Replace(":", string.Empty);
 
-            RegisterAsyncTask(new System.Web.UI.PageAsyncTask(()=>callSatispayAuthentication(key_id,privateKeyPem)));
+            RegisterAsyncTask(new System.Web.UI.PageAsyncTask(()=>callSatispayAuthentication(privateKeyPem)));
             //string digest;
             //using (SHA256 sha256 = SHA256.Create())
             //{
