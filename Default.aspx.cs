@@ -160,6 +160,37 @@ namespace Satispay
                 writer.WriteNullValue();
         }
     }
+    public class RequestKeyIdRequest
+    {
+        public string public_key { get; set; }
+
+        public string token { get; set; }
+    }
+
+    public class RequestKeyIdResponse
+    {
+        public string key_id { get; set; }
+    }
+
+    public class DailyClosure
+    {
+        public string id { get; set; }
+
+        [JsonConverter(typeof(SatispayDateTimeConverter))]
+        public DateTime? date { get; set; }
+    }
+
+    public class PaymentDetailsResponse<T> : PaymentResponse<T>
+    {
+        public DailyClosure daily_closure { get; set; }
+    }
+
+    public class UpdatePaymentRequest<T>
+    {
+        [JsonConverter(typeof(JsonStringEnumConverter))]
+        public UpdateAction action { get; set; }
+        public T metadata { get; set; }
+    }
 
     public class Api
     {
@@ -213,17 +244,7 @@ namespace Satispay
         }
 
 
-        public class RequestKeyIdRequest
-        {
-            public string public_key { get; set; }
-
-            public string token { get; set; }
-        }
-
-        public class RequestKeyIdResponse
-        {
-            public string key_id { get; set; }
-        }
+       
 
         public async Task<string> RequestKeyId(RequestKeyIdRequest request)
         {
@@ -313,8 +334,7 @@ namespace Satispay
 
                 string stringContent = string.Empty;
 
-                try
-                {
+                
                     response = await httpClient.SendAsync(httpRequestMessage);
 
                     stringContent = await response.Content.ReadAsStringAsync();
@@ -322,15 +342,7 @@ namespace Satispay
                     response.EnsureSuccessStatusCode();
 
                     return JsonSerializer.Deserialize<T>(stringContent);
-                }
-                catch (HttpRequestException)
-                {
-                    throw new SatispayException(stringContent, response.StatusCode);
-                }
-                catch (JsonException)
-                {
-                    throw new SatispayException(stringContent, HttpStatusCode.OK);
-                }
+               
             }
         }
 
@@ -357,10 +369,12 @@ namespace Satispay
             return signer.VerifySignature(sigBytes);
         }
 
+        
+
+
         public async Task<CreatePaymentResponse<T>> CreatePayment<T>(CreatePaymentRequest<T> request, string idempotencyKey = null)
         {
-            if (request.amount_unit == 0)
-                throw new SatispayException("amount_unit must be greater than 0", HttpStatusCode.BadRequest);
+           
 
             var response = await SendJsonAsync<CreatePaymentResponse<T>>(HttpMethod.Post, "payments", request, idempotencyKey);
 
@@ -384,12 +398,16 @@ namespace Satispay
 
 
 
+    public partial class Default : System.Web.UI.Page
+    {
 
 
-
-    private async Task callSatispayAuthentication(string keyId, string privateKey)
+        private async Task callSatispayAuthentication(string keyId, string privateKey)
         {
-            var AuthenticationResource = await TestAuthenticationAsync(keyId, privateKey);
+
+        Api api = new Api(null, true);
+        api.PrivateKey=privateKey;
+        var pResponse = await api.CreatePayment(null,null);
         }
 
 
